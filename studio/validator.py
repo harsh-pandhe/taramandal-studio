@@ -3,6 +3,7 @@ Taramandal Studio - Trajectory Safety Validator
 """
 
 import math
+from scipy.spatial import cKDTree
 
 def interpolate_waypoint(waypoints: list, t: float) -> dict:
     if not waypoints:
@@ -89,24 +90,29 @@ def validate_choreography(
             if pos:
                 active_positions[d["id"]] = pos
                 
-        # Compare all pairs
+        # High-performance cKDTree proximity checks
         d_ids = list(active_positions.keys())
-        for i in range(len(d_ids)):
-            for j in range(i + 1, len(d_ids)):
-                id1 = d_ids[i]
-                id2 = d_ids[j]
-                p1 = active_positions[id1]
-                p2 = active_positions[id2]
+        if len(d_ids) >= 2:
+            coords = [[active_positions[d_id]["x"], active_positions[d_id]["y"], active_positions[d_id]["z"]] for d_id in d_ids]
+            tree = cKDTree(coords)
+            
+            # Find all pairs within collision limit
+            pairs = tree.query_pairs(safe_dist_threshold)
+            for i, j in pairs:
+                p1 = coords[i]
+                p2 = coords[j]
+                dist = ((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2)**0.5
+                violations["proximity"].append({
+                    "time": round(t, 2),
+                    "drones": [d_ids[i], d_ids[j]],
+                    "distance": round(dist, 2)
+                })
                 
-                dist = ((p1["x"] - p2["x"])**2 + (p1["y"] - p2["y"])**2 + (p1["z"] - p2["z"])**2)**0.5
-                min_dist_found = min(min_dist_found, dist)
-                
-                if dist < safe_dist_threshold:
-                    violations["proximity"].append({
-                        "time": round(t, 2),
-                        "drones": [id1, id2],
-                        "distance": round(dist, 2)
-                    })
+            # Query global min distance efficiently at this timestep
+            dists, _ = tree.query(coords, k=2)
+            for d_row in dists:
+                if len(d_row) > 1:
+                    min_dist_found = min(min_dist_found, d_row[1])
                     
         # 2. Kinematics check
         for d_id, curr_wp in active_positions.items():

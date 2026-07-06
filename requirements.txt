@@ -4,3 +4,4 @@ pydantic
 pandas
 pytest
 pytest-asyncio
+scipy

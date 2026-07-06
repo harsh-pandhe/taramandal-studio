@@ -43,6 +43,7 @@ export default function App() {
   const dronesGroupRef = useRef(null);
   const pathsGroupRef = useRef(null);
   const gridHelperRef = useRef(null);
+  const instancedMeshRef = useRef(null);
   
   // Input settings
   const [shape, setShape] = useState("circle");
@@ -240,45 +241,59 @@ export default function App() {
     });
   }, [choreoData]);
   
-  // Update moving spheres based on currentTime
+  // Re-create InstancedMesh when choreoData changes
   useEffect(() => {
     if (!dronesGroupRef.current || !choreoData) return;
     
-    // Clear old drone spheres
+    // Clear old objects
     while (dronesGroupRef.current.children.length > 0) {
       dronesGroupRef.current.remove(dronesGroupRef.current.children[0]);
     }
     
+    const numDrones = choreoData.drones.length;
+    if (numDrones === 0) return;
+    
+    // Create single geometry and material
+    const geometry = new THREE.SphereGeometry(0.3, 16, 16);
+    const material = new THREE.MeshPhongMaterial({ 
+      shininess: 100
+    });
+    
+    const instancedMesh = new THREE.InstancedMesh(geometry, material, numDrones);
+    dronesGroupRef.current.add(instancedMesh);
+    instancedMeshRef.current = instancedMesh;
+    
+    // Set individual colors at initialization
     const colors = [0x38bdf8, 0x10b981, 0xf59e0b, 0xec4899, 0x8b5cf6, 0x3b82f6];
+    const threeColor = new THREE.Color();
+    for (let idx = 0; idx < numDrones; idx++) {
+      threeColor.setHex(colors[idx % colors.length]);
+      instancedMesh.setColorAt(idx, threeColor);
+    }
+    instancedMesh.instanceColor.needsUpdate = true;
+  }, [choreoData]);
+  
+  // Update InstancedMesh matrices based on currentTime
+  useEffect(() => {
+    if (!instancedMeshRef.current || !choreoData) return;
+    
+    const instancedMesh = instancedMeshRef.current;
+    const dummy = new THREE.Object3D();
     
     choreoData.drones.forEach((drone, idx) => {
-      const color = colors[idx % colors.length];
       const wp = interpolateWaypoint(drone.waypoints, currentTime);
-      
       if (wp) {
-        // Drone sphere
-        const geometry = new THREE.SphereGeometry(0.3, 16, 16);
-        const material = new THREE.MeshPhongMaterial({ 
-          color: color,
-          emissive: color,
-          emissiveIntensity: 0.3,
-          shininess: 100
-        });
-        const sphere = new THREE.Mesh(geometry, material);
-        sphere.position.set(wp.x, -wp.z, wp.y);
-        dronesGroupRef.current.add(sphere);
+        dummy.position.set(wp.x, -wp.z, wp.y);
         
-        // Dynamic orientation indicator line (heading direction)
-        const yawRad = THREE.MathUtils.degToRad(wp.yaw);
-        const indicatorGeo = new THREE.BufferGeometry().setFromPoints([
-          new THREE.Vector3(0, 0, 0),
-          new THREE.Vector3(Math.cos(yawRad) * 0.7, 0, Math.sin(yawRad) * 0.7)
-        ]);
-        const indicatorMat = new THREE.LineBasicMaterial({ color: 0xffffff });
-        const indicator = new THREE.Line(indicatorGeo, indicatorMat);
-        sphere.add(indicator);
+        // Convert yaw angle to Z rotation
+        dummy.rotation.y = THREE.MathUtils.degToRad(wp.yaw);
+        dummy.updateMatrix();
+        
+        instancedMesh.setMatrixAt(idx, dummy.matrix);
       }
     });
+    
+    instancedMesh.instanceMatrix.needsUpdate = true;
   }, [choreoData, currentTime]);
   
   // Playback timer loop
