@@ -62,6 +62,7 @@ export default function App() {
   const [validation, setValidation] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [sendingToGCS, setSendingToGCS] = useState(false);
   
   // Playback state
   const [currentTime, setCurrentTime] = useState(0.0);
@@ -424,6 +425,47 @@ export default function App() {
       alert("Error exporting choreography: " + e.message);
     }
   };
+
+  const handleSendToGCS = async () => {
+    if (!choreoData) return;
+    setSendingToGCS(true);
+    try {
+      // 1. Export in JSON format
+      const res = await fetch(`${API_BASE}/api/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          choreo: choreoData,
+          format: "json",
+          home_lat: Number(homeLat),
+          home_lon: Number(homeLon)
+        })
+      });
+      if (!res.ok) throw new Error("Failed to format choreography for GCS.");
+      const data = await res.json();
+      
+      // 2. Package into FormData
+      const blob = new Blob([data.content], { type: "application/json" });
+      const formData = new FormData();
+      formData.append("file", blob, data.filename);
+      
+      // 3. Post to GCS backend API (port 5000)
+      const gcsRes = await fetch("http://localhost:5000/api/upload-trajectory", {
+        method: "POST",
+        body: formData
+      });
+      if (!gcsRes.ok) {
+        const errorDetails = await gcsRes.json();
+        throw new Error(errorDetails.detail || "GCS rejected show file.");
+      }
+      
+      alert("✅ Trajectory successfully pushed to GCS fleet! Run launch checks on GCS dashboard.");
+    } catch (e) {
+      alert("❌ Failed pushing trajectory to GCS: " + e.message);
+    } finally {
+      setSendingToGCS(false);
+    }
+  };
   
   return (
     <div className="studio-container">
@@ -636,6 +678,23 @@ export default function App() {
             </div>
             <button className="btn-primary" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', justifyContent: 'center', marginTop: '0.5rem' }} onClick={() => handleExport("kml")}>
               <Globe size={16} /> Export Google Earth KML
+            </button>
+            
+            <button 
+              className="btn-primary" 
+              style={{ 
+                display: 'flex', 
+                gap: '0.5rem', 
+                alignItems: 'center', 
+                justifyContent: 'center', 
+                marginTop: '0.5rem',
+                background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                boxShadow: '0 0 10px rgba(16, 185, 129, 0.3)'
+              }} 
+              onClick={handleSendToGCS}
+              disabled={sendingToGCS || !choreoData}
+            >
+              🚀 {sendingToGCS ? "Sending..." : "Send to GCS Fleet"}
             </button>
           </div>
         </aside>
