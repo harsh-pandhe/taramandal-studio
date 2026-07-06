@@ -44,6 +44,7 @@ export default function App() {
   const pathsGroupRef = useRef(null);
   const gridHelperRef = useRef(null);
   const instancedMeshRef = useRef(null);
+  const indicatorMeshRef = useRef(null);
   
   // Input settings
   const [shape, setShape] = useState("circle");
@@ -253,15 +254,25 @@ export default function App() {
     const numDrones = choreoData.drones.length;
     if (numDrones === 0) return;
     
-    // Create single geometry and material
+    // Create single geometry and material with emissive properties restored
     const geometry = new THREE.SphereGeometry(0.3, 16, 16);
     const material = new THREE.MeshPhongMaterial({ 
-      shininess: 100
+      shininess: 100,
+      emissive: 0x222222,
+      emissiveIntensity: 0.5
     });
     
     const instancedMesh = new THREE.InstancedMesh(geometry, material, numDrones);
     dronesGroupRef.current.add(instancedMesh);
     instancedMeshRef.current = instancedMesh;
+    
+    // Heading Indicator Mesh (cone pointing forward)
+    const indicatorGeo = new THREE.ConeGeometry(0.12, 0.5, 5);
+    indicatorGeo.rotateX(Math.PI / 2); // Rotate to point forward along the Z path
+    const indicatorMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    const indicatorMesh = new THREE.InstancedMesh(indicatorGeo, indicatorMat, numDrones);
+    dronesGroupRef.current.add(indicatorMesh);
+    indicatorMeshRef.current = indicatorMesh;
     
     // Set individual colors at initialization
     const colors = [0x38bdf8, 0x10b981, 0xf59e0b, 0xec4899, 0x8b5cf6, 0x3b82f6];
@@ -275,25 +286,40 @@ export default function App() {
   
   // Update InstancedMesh matrices based on currentTime
   useEffect(() => {
-    if (!instancedMeshRef.current || !choreoData) return;
+    if (!instancedMeshRef.current || !indicatorMeshRef.current || !choreoData) return;
     
     const instancedMesh = instancedMeshRef.current;
+    const indicatorMesh = indicatorMeshRef.current;
     const dummy = new THREE.Object3D();
     
     choreoData.drones.forEach((drone, idx) => {
       const wp = interpolateWaypoint(drone.waypoints, currentTime);
       if (wp) {
+        // Drone position sphere
         dummy.position.set(wp.x, -wp.z, wp.y);
-        
-        // Convert yaw angle to Z rotation
         dummy.rotation.y = THREE.MathUtils.degToRad(wp.yaw);
+        dummy.scale.set(1.0, 1.0, 1.0);
         dummy.updateMatrix();
-        
         instancedMesh.setMatrixAt(idx, dummy.matrix);
+        
+        // Heading indicator (rendered slightly above the sphere)
+        dummy.position.set(wp.x, -wp.z + 0.35, wp.y);
+        dummy.rotation.y = THREE.MathUtils.degToRad(wp.yaw);
+        dummy.scale.set(1.0, 1.0, 1.0);
+        dummy.updateMatrix();
+        indicatorMesh.setMatrixAt(idx, dummy.matrix);
+      } else {
+        // Hide inactive/pre-start drone instances by setting scale to 0 and moving below ground
+        dummy.position.set(0, -999.0, 0);
+        dummy.scale.set(0.0, 0.0, 0.0);
+        dummy.updateMatrix();
+        instancedMesh.setMatrixAt(idx, dummy.matrix);
+        indicatorMesh.setMatrixAt(idx, dummy.matrix);
       }
     });
     
     instancedMesh.instanceMatrix.needsUpdate = true;
+    indicatorMesh.instanceMatrix.needsUpdate = true;
   }, [choreoData, currentTime]);
   
   // Playback timer loop
