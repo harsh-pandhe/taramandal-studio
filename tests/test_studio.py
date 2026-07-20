@@ -1,5 +1,5 @@
 import pytest
-from studio.generator import generate_circle, generate_helix, generate_heart, generate_cube
+from studio.generator import generate_circle, generate_helix, generate_heart, generate_cube, generate_spline
 from studio.validator import validate_choreography
 from studio.exporter import export_kml, export_csv, export_json
 
@@ -8,7 +8,8 @@ def test_generate_shapes():
         generate_circle(3, 10.0, 2.0),
         generate_helix(3, 10.0, 2.0),
         generate_heart(3, 10.0, 2.0),
-        generate_cube(3, 10.0, 2.0)
+        generate_cube(3, 10.0, 2.0),
+        generate_spline(3, 10.0, 2.0)
     ]
     for choreo in shapes:
         assert "drones" in choreo
@@ -76,3 +77,12 @@ def test_kml_export():
     assert "</kml>" in kml
     assert "Drone 00" in kml
     assert "relativeToGround" in kml
+
+def test_json_csv_export():
+    choreo = generate_circle(num_drones=2, duration=10.0, rate=2.0)
+    json_out = export_json(choreo)
+    csv_out = export_csv(choreo)
+    
+    assert "drones" in json_out
+    assert "waypoints" in json_out
+    assert "drone_id,time,x,y,z,yaw" in csv_out

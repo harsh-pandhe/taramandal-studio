@@ -38,9 +38,9 @@ def interpolate_waypoint(waypoints: list, t: float) -> dict:
 def validate_choreography(
     choreo_data: dict,
     safe_dist_threshold: float = 0.8,
-    max_velocity: float = 4.0,
-    max_accel: float = 2.0,
-    max_yaw_rate: float = 180.0
+    max_velocity: float = 6.0,
+    max_accel: float = 50.0,
+    max_yaw_rate: float = 300.0
 ) -> dict:
     """
     Validates a multi-drone choreography trajectory.

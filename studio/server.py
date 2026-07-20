@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 
-from studio.generator import generate_circle, generate_helix, generate_heart, generate_cube
+from studio.generator import generate_circle, generate_helix, generate_heart, generate_cube, generate_spline
 from studio.validator import validate_choreography
 from studio.exporter import export_json, export_csv, export_kml
 
@@ -27,6 +27,8 @@ class GenerateRequest(BaseModel):
     num_drones: int = Field(3, ge=1, le=10, description="Number of drones")
     duration: float = Field(30.0, ge=10.0, le=120.0, description="Duration in seconds")
     rate: float = Field(2.0, ge=1.0, le=10.0, description="Sampling rate (Hz)")
+    spawn_offsets: Optional[list[float]] = Field(None, description="Custom spawn offsets per drone")
+    target_heights: Optional[list[float]] = Field(None, description="Custom target hover heights per drone")
 
 class ExportRequest(BaseModel):
     choreo: dict = Field(..., description="Choreography dataset")
@@ -43,13 +45,15 @@ def api_generate(req: GenerateRequest):
     shape = req.shape.lower()
     
     if shape == "circle":
-        choreo = generate_circle(req.num_drones, req.duration, req.rate)
+        choreo = generate_circle(req.num_drones, req.duration, req.rate, req.spawn_offsets, req.target_heights)
     elif shape == "helix":
-        choreo = generate_helix(req.num_drones, req.duration, req.rate)
+        choreo = generate_helix(req.num_drones, req.duration, req.rate, req.spawn_offsets, req.target_heights)
     elif shape == "heart":
-        choreo = generate_heart(req.num_drones, req.duration, req.rate)
+        choreo = generate_heart(req.num_drones, req.duration, req.rate, req.spawn_offsets, req.target_heights)
     elif shape == "cube":
-        choreo = generate_cube(req.num_drones, req.duration, req.rate)
+        choreo = generate_cube(req.num_drones, req.duration, req.rate, req.spawn_offsets, req.target_heights)
+    elif shape == "spline":
+        choreo = generate_spline(req.num_drones, req.duration, req.rate, req.spawn_offsets, req.target_heights)
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported shape format: {req.shape}")
         
@@ -93,4 +97,7 @@ def api_export(req: ExportRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    import os
+    host = os.environ.get("STUDIO_HOST", "127.0.0.1")
+    port = int(os.environ.get("STUDIO_PORT", 8001))
+    uvicorn.run(app, host=host, port=port)
