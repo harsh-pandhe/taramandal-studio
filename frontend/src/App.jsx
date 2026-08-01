@@ -133,23 +133,37 @@ const buildSequencedShow = (scenes, n, rate, targetIdx = null) => {
   // segments intersecting). Centred layering balances the excursion; the trapezoid
   // holds full vertical separation through the crossing-prone middle. z is NED
   // (negative = up), so subtracting the lift raises the drone. TRANSIT_GAP > 1.5 m.
-  const TRANSIT_GAP = 1.4;             // vertical layer spacing (> 0.8 m proximity limit)
+  // Vertical layer spacing during a morph. Must clear the STRICTER of the two
+  // safety limits in this pipeline: Studio's own validator uses 0.8 m, but the
+  // GCS backend's pre-flight collision check (backend/trajectory_parser.py,
+  // matching the live 10 Hz proximity monitor) uses 1.5 m — a real mismatch
+  // this dress rehearsal caught: a show that passed Studio's check was still
+  // rejected at GCS upload. 2.0 m clears 1.5 m with margin.
+  const TRANSIT_GAP = 2.0;
   const MAX_H = 3.2, MAX_V = 2.4;      // velocity budget (m/s); ×1.5 smoothstep peak stays < 6
   const smooth = (u) => u * u * (3 - 2 * u);          // ease-in-out: zero velocity at ends
   // Smoothstep-rounded trapezoid for the transit lift: full separation through the
-  // crossing-prone middle, eased corners so acceleration stays within limits.
+  // crossing-prone middle, eased corners so acceleration stays within limits. A
+  // short 0.15 ramp (vs. a wider one) reaches full vertical separation quickly,
+  // minimizing time spent at partial lift where horizontal closing distance can
+  // combine with incomplete vertical separation to breach the safety limit —
+  // exactly what the live dress rehearsal caught at the takeoff→first-formation
+  // morph (min separation briefly dipped to ~1.4 m against the 1.5 m GCS limit).
+  const TRANSIT_RAMP = 0.15; // fraction of the morph spent ramping the lift up/down
   const transitProfile = (kk) => {
-    const raw = Math.max(0, Math.min(1, kk / 0.4, (1 - kk) / 0.4));
+    const raw = Math.max(0, Math.min(1, kk / TRANSIT_RAMP, (1 - kk) / TRANSIT_RAMP));
     return smooth(raw);
   };
   const morph = (from, to, secs) => {
     // Auto-pace: never exceed the velocity budget, regardless of the user's
     // requested transition time (respect the safety limit over timing). Both the
     // horizontal move and the vertical lift ease in/out (smoothstep) so velocity
-    // is zero at the hold junctions — no acceleration spikes.
+    // is zero at the hold junctions — no acceleration spikes. The lift covers
+    // `maxLift` over just the TRANSIT_RAMP fraction of the morph (not the whole
+    // thing), so its effective speed requirement is scaled accordingly.
     const maxTravel = Math.max(...from.map((a, i) => Math.hypot(a.x - to[i].x, a.y - to[i].y)));
     const maxLift = TRANSIT_GAP * (n - 1) / 2;
-    const secsSafe = Math.max(secs, maxTravel / MAX_H, maxLift / (0.4 * MAX_V));
+    const secsSafe = Math.max(secs, maxTravel / MAX_H, maxLift / (TRANSIT_RAMP * MAX_V));
     const steps = Math.max(1, Math.round(secsSafe * r));
     for (let k = 1; k <= steps; k++) {
       const kk = k / steps, prof = transitProfile(kk);
