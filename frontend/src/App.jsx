@@ -16,11 +16,16 @@ import {
   Trash,
   Save,
   Edit2,
-  X 
+  Sparkles,
+  X
 } from 'lucide-react';
 import './App.css';
 
-const API_BASE = "http://127.0.0.1:8001";
+// Studio's own choreography backend. Override at build time with VITE_API_BASE.
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8001";
+// The GCS fleet backend the "Send to GCS" button pushes trajectories to.
+// Override with VITE_GCS_BASE (defaults to the GCS backend's default port 8000).
+const GCS_BASE = import.meta.env.VITE_GCS_BASE || "http://localhost:8000";
 
 const interpolateWaypoint = (waypoints, t) => {
   if (!waypoints || waypoints.length === 0) return null;
@@ -43,6 +48,95 @@ const interpolateWaypoint = (waypoints, t) => {
   return waypoints[waypoints.length - 1];
 };
 
+// ============================================================================
+// Formation library + show sequencer
+// A drone show is a *sequence of formations* (point clouds) the fleet morphs
+// between, not a single parametric shape. Each formation generator returns N
+// target positions in the fleet frame at show altitude (NED z negative = up).
+// ============================================================================
+const SHOW_ALT = 8.0; // metres above ground for formations
+
+const fmtCircle = (n) => {
+  const r = Math.max(4, n * 0.6), cy = n;
+  return Array.from({ length: n }, (_, i) => {
+    const a = (2 * Math.PI * i) / n;
+    return { x: 5 + r * Math.cos(a), y: cy + r * Math.sin(a), z: -SHOW_ALT };
+  });
+};
+const fmtGrid = (n) => {
+  const side = Math.ceil(Math.sqrt(n)), sp = 2.5;
+  return Array.from({ length: n }, (_, i) => ({ x: (i % side) * sp, y: Math.floor(i / side) * sp, z: -SHOW_ALT }));
+};
+const fmtLine = (n) => {
+  const sp = 2.5;
+  return Array.from({ length: n }, (_, i) => ({ x: i * sp, y: n, z: -SHOW_ALT }));
+};
+const fmtHeart = (n) => Array.from({ length: n }, (_, i) => {
+  const t = (2 * Math.PI * i) / n;
+  const hx = 16 * Math.pow(Math.sin(t), 3);
+  const hy = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+  return { x: 5 + hx * 0.4, y: n + hy * 0.4, z: -SHOW_ALT };
+});
+const fmtSphere = (n) => {
+  const r = Math.max(4, n * 0.5), cy = n, out = [];
+  for (let i = 0; i < n; i++) {
+    const phi = Math.acos(1 - (2 * (i + 0.5)) / n);
+    const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+    out.push({ x: 5 + r * Math.sin(phi) * Math.cos(theta), y: cy + r * Math.sin(phi) * Math.sin(theta), z: -SHOW_ALT - r * Math.cos(phi) });
+  }
+  return out;
+};
+const fmtVee = (n) => {
+  const sp = 2.0;
+  return Array.from({ length: n }, (_, i) => {
+    const side = i % 2 === 0 ? 1 : -1, k = Math.ceil(i / 2);
+    return { x: k * sp, y: n + side * k * sp, z: -SHOW_ALT };
+  });
+};
+const FORMATIONS = { circle: fmtCircle, grid: fmtGrid, line: fmtLine, heart: fmtHeart, sphere: fmtSphere, vee: fmtVee };
+const FORMATION_LABELS = { circle: 'Ring', grid: 'Grid', line: 'Line', heart: 'Heart', sphere: 'Sphere', vee: 'V-Formation' };
+const buildFormation = (shape, n) => (FORMATIONS[shape] || fmtCircle)(n);
+
+// Stitches scenes into one full trajectory: takeoff → (hold + morph)* → land.
+// Produces the standard {drones:[{id,waypoints:[{time,x,y,z,yaw}]}]} schema so
+// preview / validation / LED / export all work unchanged.
+const buildSequencedShow = (scenes, n, rate) => {
+  if (!scenes.length || n < 1) return { drones: [], _duration: 0 };
+  const TAKEOFF = 5.0, LAND = 5.0;
+  const r = Math.max(1, rate), dt = 1 / r;
+  const ground = Array.from({ length: n }, (_, i) => ({ x: 0, y: 2 * i, z: 0 }));
+  const forms = scenes.map((s) => buildFormation(s.shape, n));
+  const wps = Array.from({ length: n }, () => []);
+  let t = 0;
+  const round2 = (v) => parseFloat(v.toFixed(2));
+  const push = (positions) => {
+    for (let i = 0; i < n; i++) {
+      const p = positions[i];
+      wps[i].push({ time: round2(t), x: round2(p.x), y: round2(p.y), z: round2(p.z), yaw: 0 });
+    }
+  };
+  const lerp = (A, B, k) => A.map((a, i) => ({ x: a.x + (B[i].x - a.x) * k, y: a.y + (B[i].y - a.y) * k, z: a.z + (B[i].z - a.z) * k }));
+
+  // Takeoff: ground → first formation
+  const toSteps = Math.round(TAKEOFF * r);
+  for (let s = 0; s <= toSteps; s++) { push(lerp(ground, forms[0], s / toSteps)); t += dt; }
+  // Each scene: hold, then morph to the next
+  for (let s = 0; s < forms.length; s++) {
+    const holdSteps = Math.round((scenes[s].hold || 3) * r);
+    for (let k = 0; k <= holdSteps; k++) { push(forms[s]); t += dt; }
+    if (s < forms.length - 1) {
+      const trSteps = Math.round((scenes[s].transition || 3) * r);
+      for (let k = 1; k <= trSteps; k++) { push(lerp(forms[s], forms[s + 1], k / trSteps)); t += dt; }
+    }
+  }
+  // Landing: last formation → ground
+  const lastForm = forms[forms.length - 1];
+  const laSteps = Math.round(LAND * r);
+  for (let k = 1; k <= laSteps; k++) { push(lerp(lastForm, ground, k / laSteps)); t += dt; }
+
+  return { drones: wps.map((w, i) => ({ id: i, waypoints: w })), _duration: round2(t - dt) };
+};
+
 export default function App() {
   const containerRef = useRef(null);
   const rendererRef = useRef(null);
@@ -56,7 +150,7 @@ export default function App() {
   const [activePage, setActivePage] = useState("choreo"); // 'choreo', 'projects', 'fleet'
   const [projectName, setProjectName] = useState("Standard Orbit Formation");
   const [activeProjectId, setActiveProjectId] = useState("default-proj");
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(true);
   const [drawerTab, setDrawerTab] = useState("design"); // 'design', 'safety', 'transmit'
   
   // Dynamic swarm fleet list (single source of truth)
@@ -176,6 +270,18 @@ export default function App() {
   const [duration, setDuration] = useState(30.0);
   const [rate, setRate] = useState(2.0);
   const [prompt, setPrompt] = useState("");
+  const [promptHint, setPromptHint] = useState(null);
+
+  // LED / light choreography
+  const [lightEffect, setLightEffect] = useState("perDrone"); // perDrone | solid | rainbow | gradient | pulse
+  const [lightColor, setLightColor] = useState("#38bdf8");
+
+  // Show sequencer — ordered list of formation scenes
+  const [scenes, setScenes] = useState([
+    { id: 1, shape: 'circle', hold: 4, transition: 3 },
+    { id: 2, shape: 'heart', hold: 4, transition: 3 },
+    { id: 3, shape: 'grid', hold: 4, transition: 3 },
+  ]);
   
   // Geography Reference
   const [homeLat, setHomeLat] = useState(12.9716);
@@ -188,10 +294,13 @@ export default function App() {
   const [error, setError] = useState(null);
   const [sendingToGCS, setSendingToGCS] = useState(false);
   
-  // Security Access Barrier
+  // Security Access Barrier.
+  // Opt-in dev bypass: set VITE_DISABLE_AUTH=true to skip the passphrase gate in
+  // local/dev/demo builds. Defaults to auth ON, so production builds are unaffected.
+  const AUTH_DISABLED = import.meta.env.VITE_DISABLE_AUTH === "true";
   const [passcode, setPasscode] = useState("");
   const [isUnlocked, setIsUnlocked] = useState(() => {
-    return sessionStorage.getItem("taramandal_unlocked") === "true";
+    return AUTH_DISABLED || sessionStorage.getItem("taramandal_unlocked") === "true";
   });
   const [accessError, setAccessError] = useState("");
 
@@ -496,9 +605,12 @@ export default function App() {
       window.removeEventListener('mouseup', handleMouseUp);
       container.removeEventListener('wheel', handleWheel);
       window.removeEventListener('resize', handleResize);
-      if (renderer.domElement) {
+      // Guard removeChild: the container may already be detached (e.g. after a
+      // view switch), which would otherwise throw NotFoundError and blank the app.
+      if (renderer.domElement && container && container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
+      renderer.dispose();
     };
   }, []);
   
@@ -567,9 +679,13 @@ export default function App() {
       const canopyMat = new THREE.MeshPhongMaterial({
         color: droneColor,
         shininess: 120,
-        emissive: 0x111111
+        // Per-drone self-glow in the drone's own color (dimmed), so each drone
+        // reads distinctly even in low-light scenes instead of a flat grey glow.
+        emissive: droneColor,
+        emissiveIntensity: 0.35
       });
       const canopy = new THREE.Mesh(canopyGeo, canopyMat);
+      canopy.name = "canopy";
       canopy.position.set(0, 0.045, 0);
       droneGroup.add(canopy);
       
@@ -697,19 +813,31 @@ export default function App() {
           });
         }
         
-        // Pulse underbelly LED on audio beats
+        // Live LED choreography — the drone glows its choreographed colour at
+        // this instant. This is what turns the tool from a trajectory previewer
+        // into a light-show previewer.
+        const ledColor = droneColorAt(idx, currentTime);
+        const canopy = droneGroup.children.find(c => c.name === "canopy");
+        if (canopy) {
+          canopy.material.color.copy(ledColor);
+          canopy.material.emissive.copy(ledColor);
+          canopy.material.emissiveIntensity = 0.9;
+        }
+
+        // Pulse underbelly LED on audio beats, tinted to the choreographed colour
         const led = droneGroup.children.find(c => c.name === "underbelly_led");
         if (led) {
+          led.material.color.copy(ledColor);
           const pulseScale = 1.0 + (audioVolume || 0) * 1.8;
           led.scale.set(pulseScale, pulseScale, pulseScale);
         }
-        
+
         droneGroup.visible = true;
       } else {
         droneGroup.visible = false;
       }
     });
-  }, [choreoData, currentTime, audioVolume]);
+  }, [choreoData, currentTime, audioVolume, lightEffect, lightColor, dronesList]);
   
   // Playback timer loop
   useEffect(() => {
@@ -791,7 +919,9 @@ export default function App() {
     if (t.includes("heart")) parsedShape = "heart";
     else if (t.includes("helix") || t.includes("spiral")) parsedShape = "helix";
     else if (t.includes("cube") || t.includes("grid") || t.includes("box")) parsedShape = "cube";
-    else if (t.includes("circle") || t.includes("ring")) parsedShape = "circle";
+    else if (t.includes("circle") || t.includes("ring") || t.includes("orbit")) parsedShape = "circle";
+    else if (t.includes("spline") || t.includes("bezier") || t.includes("curve")) parsedShape = "spline";
+    else if (t.includes("mesh") || t.includes("obj") || t.includes("model")) parsedShape = "mesh";
     
     // Parse Drones count (1 to 10)
     let parsedDrones = null;
@@ -828,6 +958,102 @@ export default function App() {
     };
   };
   
+  // Computes a drone's LED colour at time t from the active light effect.
+  // Returns a THREE.Color (used by the 3D preview and, via getHexString, export).
+  const droneColorAt = (idx, t) => {
+    const c = new THREE.Color();
+    const n = Math.max(1, numDrones);
+    const cfg = dronesList.find(d => d.id === idx);
+    const baseHex = cfg ? cfg.colorHex : lightColor;
+    switch (lightEffect) {
+      case 'solid':
+        c.set(lightColor);
+        break;
+      case 'rainbow': {
+        const hue = (((t / (duration || 1)) + idx / n) % 1 + 1) % 1;
+        c.setHSL(hue, 0.85, 0.55);
+        break;
+      }
+      case 'gradient': {
+        const base = new THREE.Color(lightColor);
+        const hsl = {};
+        base.getHSL(hsl);
+        c.setHSL((hsl.h + (idx / n) * 0.5) % 1, Math.max(0.6, hsl.s), 0.55);
+        break;
+      }
+      case 'pulse': {
+        c.set(baseHex);
+        const beat = audioVolume ? audioVolume : (0.5 + 0.5 * Math.sin(t * 3));
+        c.multiplyScalar(Math.min(1.6, 0.55 + beat));
+        break;
+      }
+      case 'perDrone':
+      default:
+        c.set(baseHex);
+        break;
+    }
+    return c;
+  };
+
+  const handleGenerateFromPrompt = () => {
+    if (!prompt.trim()) return;
+    const parsed = parsePromptParameters(prompt);
+    const recognized = [];
+    if (parsed.shape) recognized.push(`shape=${parsed.shape}`);
+    if (parsed.numDrones !== null) recognized.push(`drones=${parsed.numDrones}`);
+    if (parsed.duration !== null) recognized.push(`duration=${parsed.duration}s`);
+    if (parsed.rate !== null) recognized.push(`rate=${parsed.rate}Hz`);
+
+    if (recognized.length === 0) {
+      setPromptHint({
+        ok: false,
+        text: "No parameters recognized. Try keywords: heart / helix / cube / circle / spline, a drone count, duration (s), or rate (Hz).",
+      });
+      return;
+    }
+    setPromptHint({ ok: true, text: `Applied → ${recognized.join(" · ")}` });
+    handleGenerate();
+  };
+
+  // --- Sequencer scene management ---
+  const addScene = () => {
+    const nextId = scenes.length ? Math.max(...scenes.map(s => s.id)) + 1 : 1;
+    setScenes([...scenes, { id: nextId, shape: 'circle', hold: 4, transition: 3 }]);
+  };
+  const removeScene = (id) => setScenes(scenes.filter(s => s.id !== id));
+  const updateScene = (id, patch) => setScenes(scenes.map(s => s.id === id ? { ...s, ...patch } : s));
+  const moveScene = (index, dir) => {
+    const j = index + dir;
+    if (j < 0 || j >= scenes.length) return;
+    const copy = [...scenes];
+    [copy[index], copy[j]] = [copy[j], copy[index]];
+    setScenes(copy);
+  };
+
+  const handleBuildSequence = () => {
+    if (!scenes.length) { setError("Add at least one formation scene."); return; }
+    setLoading(true);
+    setError(null);
+    try {
+      const show = buildSequencedShow(scenes, numDrones, Number(rate));
+      setChoreoData(show);
+      setDuration(show._duration);
+      setCurrentTime(0.0);
+      setIsPlaying(false);
+      // Validate the stitched show through the backend. /api/validate takes the
+      // choreo dict directly (not wrapped), and only returns `metrics` on success.
+      fetch(`${API_BASE}/api/validate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(show)
+      }).then(r => r.ok ? r.json() : null).then(v => { if (v && v.metrics) setValidation(v); }).catch(() => {});
+    } catch (e) {
+      setError("Sequence build failed: " + e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleGenerate = async () => {
     setLoading(true);
     setError(null);
@@ -900,11 +1126,38 @@ export default function App() {
       const rangeY = maxY - minY || 1.0;
       const rangeZ = maxZ - minZ || 1.0;
       
+      // Farthest-point sampling: choose `chosenDrones` vertices that spread as
+      // evenly as possible across the mesh, so the swarm actually resembles the
+      // shape. (Naive stride sampling clustered drones wherever the OBJ had dense
+      // vertices and left sparse regions of the mesh unrepresented.)
       const selectedVertices = [];
-      const step = Math.max(1, Math.floor(vertices.length / chosenDrones));
-      for (let i = 0; i < chosenDrones; i++) {
-        const idx = (i * step) % vertices.length;
-        selectedVertices.push(vertices[idx]);
+      if (vertices.length <= chosenDrones) {
+        for (let i = 0; i < chosenDrones; i++) {
+          selectedVertices.push(vertices[i % vertices.length]);
+        }
+      } else {
+        const minDist2 = new Array(vertices.length).fill(Infinity);
+        let current = 0; // deterministic seed
+        const chosenIdx = [0];
+        for (let k = 1; k < chosenDrones; k++) {
+          const cv = vertices[current];
+          let farIdx = 0;
+          let farDist = -1;
+          for (let i = 0; i < vertices.length; i++) {
+            const dx = vertices[i].x - cv.x;
+            const dy = vertices[i].y - cv.y;
+            const dz = vertices[i].z - cv.z;
+            const d = dx * dx + dy * dy + dz * dz;
+            if (d < minDist2[i]) minDist2[i] = d;
+            if (minDist2[i] > farDist) {
+              farDist = minDist2[i];
+              farIdx = i;
+            }
+          }
+          chosenIdx.push(farIdx);
+          current = farIdx;
+        }
+        chosenIdx.forEach(i => selectedVertices.push(vertices[i]));
       }
       
       const totalSteps = Math.floor(chosenDuration * chosenRate);
@@ -1012,6 +1265,22 @@ export default function App() {
     }
   };
   
+  // Bakes the live LED colour into every waypoint (r,g,b 0-255) so exported
+  // shows carry the light choreography, not just position.
+  const buildColoredChoreo = () => {
+    if (!choreoData) return choreoData;
+    return {
+      ...choreoData,
+      drones: choreoData.drones.map((d, i) => ({
+        ...d,
+        waypoints: d.waypoints.map(wp => {
+          const c = droneColorAt(i, wp.time);
+          return { ...wp, r: Math.round(c.r * 255), g: Math.round(c.g * 255), b: Math.round(c.b * 255) };
+        })
+      }))
+    };
+  };
+
   const handleExport = async (format) => {
     if (!choreoData) return;
     try {
@@ -1019,7 +1288,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          choreo: choreoData,
+          choreo: buildColoredChoreo(),
           format: format,
           home_lat: Number(homeLat),
           home_lon: Number(homeLon)
@@ -1045,12 +1314,12 @@ export default function App() {
     if (!choreoData) return;
     setSendingToGCS(true);
     try {
-      // 1. Export in JSON format
+      // 1. Export in JSON format (with baked LED colours)
       const res = await fetch(`${API_BASE}/api/export`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          choreo: choreoData,
+          choreo: buildColoredChoreo(),
           format: "json",
           home_lat: Number(homeLat),
           home_lon: Number(homeLon)
@@ -1064,8 +1333,8 @@ export default function App() {
       const formData = new FormData();
       formData.append("file", blob, data.filename);
       
-      // 3. Post to GCS backend API (port 8000)
-      const gcsRes = await fetch("http://localhost:8000/api/upload-trajectory", {
+      // 3. Post to GCS backend API (configurable via VITE_GCS_BASE)
+      const gcsRes = await fetch(`${GCS_BASE}/api/upload-trajectory`, {
         method: "POST",
         body: formData
       });
@@ -1190,7 +1459,7 @@ export default function App() {
             {/* Sliding Control Drawer */}
             <div className={`control-drawer ${drawerOpen ? 'active' : ''}`}>
               <div className="drawer-header">
-                <h3>🎛️ CONTROL CONSOLE</h3>
+                <h3>CONTROL CONSOLE</h3>
                 <button className="close-drawer-btn" onClick={() => setDrawerOpen(false)}>
                   <X size={16} />
                 </button>
@@ -1201,6 +1470,12 @@ export default function App() {
                 <button className={`drawer-tab-btn ${drawerTab === 'design' ? 'active' : ''}`} onClick={() => setDrawerTab('design')}>
                   DESIGN
                 </button>
+                <button className={`drawer-tab-btn ${drawerTab === 'sequence' ? 'active' : ''}`} onClick={() => setDrawerTab('sequence')}>
+                  SEQUENCE
+                </button>
+                <button className={`drawer-tab-btn ${drawerTab === 'light' ? 'active' : ''}`} onClick={() => setDrawerTab('light')}>
+                  LIGHT
+                </button>
                 <button className={`drawer-tab-btn ${drawerTab === 'safety' ? 'active' : ''}`} onClick={() => setDrawerTab('safety')}>
                   SAFETY
                 </button>
@@ -1210,6 +1485,100 @@ export default function App() {
               </div>
 
               <div className="drawer-content">
+                {drawerTab === 'sequence' && (
+                  <div className="glass-panel-inner">
+                    <h4 className="section-subtitle">Show Sequence · {scenes.length} formations</h4>
+                    <div className="scene-list">
+                      {scenes.map((sc, idx) => (
+                        <div className="scene-card" key={sc.id}>
+                          <div className="scene-card-head">
+                            <span className="scene-index">{String(idx + 1).padStart(2, '0')}</span>
+                            <select value={sc.shape} onChange={(e) => updateScene(sc.id, { shape: e.target.value })} style={{ flex: 1 }}>
+                              {Object.keys(FORMATION_LABELS).map(k => <option key={k} value={k}>{FORMATION_LABELS[k]}</option>)}
+                            </select>
+                            <div className="scene-reorder">
+                              <button onClick={() => moveScene(idx, -1)} disabled={idx === 0} title="Move up">▲</button>
+                              <button onClick={() => moveScene(idx, 1)} disabled={idx === scenes.length - 1} title="Move down">▼</button>
+                            </div>
+                            <button className="scene-del" onClick={() => removeScene(sc.id)} disabled={scenes.length <= 1} title="Delete">
+                              <Trash size={13} />
+                            </button>
+                          </div>
+                          <div className="scene-card-times">
+                            <label>Hold (s)
+                              <input type="number" min="1" max="30" value={sc.hold} onChange={(e) => updateScene(sc.id, { hold: Math.max(1, parseInt(e.target.value) || 1) })} />
+                            </label>
+                            <label>Morph (s)
+                              <input type="number" min="1" max="20" value={sc.transition} onChange={(e) => updateScene(sc.id, { transition: Math.max(1, parseInt(e.target.value) || 1) })} />
+                            </label>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <button className="btn-secondary" onClick={addScene} style={{ display: 'flex', gap: '0.35rem', alignItems: 'center', justifyContent: 'center' }}>
+                      <Plus size={14} /> Add Formation
+                    </button>
+                    <button className="btn-primary" onClick={handleBuildSequence} disabled={loading} style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', justifyContent: 'center' }}>
+                      <Sparkles size={14} /> {loading ? 'BUILDING…' : 'Build Sequenced Show'}
+                    </button>
+                    <p style={{ fontSize: '0.68rem', color: 'var(--text-dim)', margin: 0, lineHeight: 1.5 }}>
+                      The fleet takes off, holds each formation, then morphs to the next. Total show length is computed from your holds + morphs.
+                    </p>
+                  </div>
+                )}
+                {drawerTab === 'light' && (
+                  <div className="glass-panel-inner">
+                    <h4 className="section-subtitle">LED Choreography</h4>
+                    <div className="form-group">
+                      <label>Light Effect</label>
+                      <select value={lightEffect} onChange={(e) => setLightEffect(e.target.value)}>
+                        <option value="perDrone">Per-Drone Palette</option>
+                        <option value="solid">Solid Colour</option>
+                        <option value="gradient">Fleet Gradient</option>
+                        <option value="rainbow">Rainbow Sweep</option>
+                        <option value="pulse">Beat Pulse (music)</option>
+                      </select>
+                    </div>
+                    <div className="form-group">
+                      <label>Base Colour {lightEffect === 'perDrone' && '(uses Swarm Fleet colours)'}</label>
+                      <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                        <input
+                          type="color"
+                          value={lightColor}
+                          onChange={(e) => setLightColor(e.target.value)}
+                          style={{ width: '48px', height: '34px', padding: '2px', cursor: 'pointer' }}
+                          disabled={lightEffect === 'perDrone'}
+                        />
+                        <input
+                          type="text"
+                          value={lightColor}
+                          onChange={(e) => setLightColor(e.target.value)}
+                          style={{ fontFamily: 'var(--mono)' }}
+                          disabled={lightEffect === 'perDrone'}
+                        />
+                      </div>
+                    </div>
+                    <p style={{ fontSize: '0.68rem', color: 'var(--text-dim)', lineHeight: 1.5, margin: 0 }}>
+                      LED colour is live in the 3D preview and follows the timeline. Colours bake into CSV/JSON export as <span style={{ fontFamily: 'var(--mono)', color: 'var(--accent)' }}>r,g,b</span> per waypoint.
+                    </p>
+                    {choreoData && (
+                      <div>
+                        <label style={{ fontSize: '0.62rem', color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.8px', fontFamily: 'var(--mono)', display: 'block', marginBottom: '0.5rem' }}>
+                          Live @ {currentTime.toFixed(1)}s
+                        </label>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
+                          {choreoData.drones.map((d, i) => {
+                            const hex = '#' + droneColorAt(i, currentTime).getHexString();
+                            return (
+                              <div key={`swatch-${i}`} title={`Drone ${String(i).padStart(2, '0')} · ${hex}`}
+                                style={{ width: '22px', height: '22px', borderRadius: '4px', background: hex, border: '1px solid var(--border)' }} />
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
                 {drawerTab === 'design' && (
                   <>
                     {/* AI Prompt Generation */}
@@ -1217,12 +1586,26 @@ export default function App() {
                       <h4 className="section-subtitle">AI Prompt Generation</h4>
                       <div className="form-group">
                         <label>AI Prompt Description</label>
-                        <textarea 
+                        <textarea
                           rows="2"
-                          placeholder="E.g., create a rotating heart shape for 6 drones"
+                          placeholder="E.g., rotating heart for 6 drones over 40 seconds"
                           value={prompt}
                           onChange={(e) => setPrompt(e.target.value)}
                         />
+                        <button
+                          className="btn-primary"
+                          style={{ marginTop: '0.5rem', display: 'flex', gap: '0.4rem', alignItems: 'center', justifyContent: 'center' }}
+                          onClick={handleGenerateFromPrompt}
+                          disabled={loading || !prompt.trim()}
+                        >
+                          <Sparkles size={14} />
+                          {loading ? 'BUILDING…' : 'Generate from Prompt'}
+                        </button>
+                        {promptHint && (
+                          <p style={{ marginTop: '0.4rem', fontSize: '0.68rem', color: promptHint.ok ? 'var(--accent)' : 'var(--warning)', fontFamily: 'var(--mono)' }}>
+                            {promptHint.text}
+                          </p>
+                        )}
                       </div>
                       <div className="form-row">
                         <div className="form-group">
@@ -1238,11 +1621,15 @@ export default function App() {
                         </div>
                         <div className="form-group">
                           <label>Drone Count</label>
-                          <input 
-                            type="text" 
-                            disabled 
-                            value={`${numDrones} Drones`}
-                            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)', color: 'var(--text-muted)' }}
+                          <input
+                            type="number"
+                            min="1"
+                            max="10"
+                            value={numDrones}
+                            onChange={(e) => {
+                              const n = Math.max(1, Math.min(10, parseInt(e.target.value) || 1));
+                              setNumDrones(n);
+                            }}
                           />
                         </div>
                       </div>
@@ -1314,7 +1701,7 @@ export default function App() {
                       {/* Music & Audio synchronization segment */}
                       <h4 className="section-subtitle" style={{ marginTop: '1rem' }}>Music Synchronization</h4>
                       <div className="form-group">
-                        <label>Load Soundtrack {audioUrl && "🎵 (Loaded)"}</label>
+                        <label>Load Soundtrack {audioUrl && "(Loaded)"}</label>
                         <input 
                           type="file" 
                           accept="audio/*"
@@ -1383,6 +1770,7 @@ export default function App() {
                           )}
                         </div>
                         
+                        {validation.metrics && (
                         <div className="metric-grid" style={{ marginBottom: '1.25rem' }}>
                           <div className="metric-card">
                             <div className="metric-title">Min Sep</div>
@@ -1409,7 +1797,8 @@ export default function App() {
                             </div>
                           </div>
                         </div>
-                        
+                        )}
+
                         <div style={{ display: 'flex', flexDirection: 'column', maxHeight: '200px' }}>
                           <span className="telemetry-label" style={{ fontSize: '0.7rem', marginBottom: '0.5rem', display: 'block' }}>
                             Safety Violations ({
@@ -1428,13 +1817,13 @@ export default function App() {
                             ))}
                             {validation.violations.velocity.map((v, i) => (
                               <div key={`v-${i}`} className="violation-item">
-                                <span>⚡ Speed warning (Drone {v.drone})</span>
+                                <span>Speed warning · Drone {v.drone}</span>
                                 <span style={{ color: 'var(--warning)', fontWeight: 600 }}>{v.velocity}m/s @ {v.time}s</span>
                               </div>
                             ))}
                             {validation.violations.acceleration.map((v, i) => (
                               <div key={`a-${i}`} className="violation-item">
-                                <span>📉 Accel warning (Drone {v.drone})</span>
+                                <span>Accel warning · Drone {v.drone}</span>
                                 <span style={{ color: 'var(--warning)', fontWeight: 600 }}>{v.acceleration}m/s² @ {v.time}s</span>
                               </div>
                             ))}
@@ -1543,8 +1932,8 @@ export default function App() {
                 <div className="matrix-view-container">
                   <h3 className="matrix-title">TELEMETRY MATRIX MULTIPLEXER</h3>
                   <div className="matrix-grid">
-                    {choreoData?.drones.map((drone, idx) => {
-                      const wp = interpolateWaypoint(drone.waypoints, currentTime);
+                    {choreoData?.drones?.map((drone, idx) => {
+                      const wp = interpolateWaypoint(drone.waypoints || [], currentTime);
                       const prevWp = currentTime > 0.1 ? interpolateWaypoint(drone.waypoints, currentTime - 0.1) : null;
                       let speed = 0.0;
                       if (wp && prevWp) {
@@ -1637,31 +2026,34 @@ export default function App() {
                     <button className="play-btn" onClick={() => setIsPlaying(!isPlaying)}>
                       {isPlaying ? <Pause size={18} /> : <Play size={18} />}
                     </button>
-                    <button className="play-btn" style={{ background: 'transparent', border: '1px solid var(--panel-border)', boxShadow: 'none' }} onClick={() => setCurrentTime(0.0)}>
+                    <button className="play-btn" style={{ background: 'transparent', border: '1px solid var(--border-strong)', color: 'var(--text-dim)', boxShadow: 'none' }} onClick={() => setCurrentTime(0.0)}>
                       <RotateCcw size={18} />
                     </button>
-                    <button 
-                      className="play-btn" 
-                      style={{ 
-                        background: isLooping ? 'rgba(56, 189, 248, 0.15)' : 'transparent', 
-                        border: isLooping ? '1px solid var(--primary)' : '1px solid var(--panel-border)', 
-                        color: isLooping ? 'var(--primary)' : 'inherit', 
-                        boxShadow: 'none' 
-                      }} 
+                    <button
+                      className="play-btn"
+                      style={{
+                        background: isLooping ? 'var(--accent-tint)' : 'transparent',
+                        border: isLooping ? '1px solid var(--accent)' : '1px solid var(--border-strong)',
+                        color: isLooping ? 'var(--accent)' : 'var(--text-dim)',
+                        boxShadow: 'none'
+                      }}
                       onClick={() => setIsLooping(!isLooping)}
                     >
                       <Repeat size={18} />
                     </button>
                     
                     <div className="slider-container">
-                      <span className="telemetry-label">Timeline</span>
-                      <input 
+                      <span className="telemetry-label">TIMELINE</span>
+                      <input
                         type="range"
                         className="timeline-slider"
                         min="0"
                         max={duration}
                         step="0.05"
                         value={currentTime}
+                        style={{
+                          background: `linear-gradient(to right, var(--accent) 0%, var(--accent) ${duration > 0 ? (currentTime / duration) * 100 : 0}%, var(--bg-input) ${duration > 0 ? (currentTime / duration) * 100 : 0}%, var(--bg-input) 100%)`
+                        }}
                         onChange={(e) => {
                           const val = Number(e.target.value);
                           setCurrentTime(val);
@@ -1704,7 +2096,7 @@ export default function App() {
           <main className="studio-viewport-page">
             <div className="vault-header">
               <div>
-                <h2>📁 Project Vault Manager</h2>
+                <h2>Project Vault</h2>
                 <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>Save progress, switch workspaces, or load choreographies from local storage cache.</p>
               </div>
               <button className="btn-primary" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }} onClick={handleCreateNewProject}>
@@ -1757,7 +2149,7 @@ export default function App() {
           <main className="studio-viewport-page">
             <div className="fleet-header">
               <div>
-                <h2>🛸 Swarm Fleet Configuration</h2>
+                <h2>Swarm Fleet Configuration</h2>
                 <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>Customize vehicle spawn offsets, flight altitude, color mapping, and add or remove vehicles.</p>
               </div>
               <button className="btn-primary" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }} onClick={handleAddDrone} disabled={dronesList.length >= 10}>

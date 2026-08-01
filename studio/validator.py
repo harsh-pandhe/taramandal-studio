@@ -69,7 +69,13 @@ def validate_choreography(
     }
     
     dt = 0.1
-    steps = int(round(max_time / dt))
+    # Use ceil (not round) so the sweep always covers the full timeline through
+    # max_time. With round(), a trajectory whose duration isn't an exact multiple
+    # of dt (e.g. 5.44s) would stop sampling early and could miss a closest-approach
+    # or limit breach in the final, unsampled segment. The extra end sample lands at
+    # t >= max_time where interpolate_waypoint clamps to the last waypoint, so it
+    # adds endpoint coverage without producing spurious kinematic violations.
+    steps = int(math.ceil(max_time / dt))
     
     # Store states of previous step to check kinematics
     prev_states = {}  # drone_id -> {"pos": (x,y,z), "vel": (vx,vy,vz), "v": scalar_v, "yaw": yaw}

@@ -13,20 +13,26 @@ def export_json(choreo_data: dict) -> str:
 def export_csv(choreo_data: dict) -> str:
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["drone_id", "time", "x", "y", "z", "yaw"])
-    
+    # Include LED colour columns (r,g,b 0-255) when the choreography carries
+    # light data, so exported shows keep their colour choreography.
+    has_color = any(
+        "r" in wp
+        for drone in choreo_data.get("drones", [])
+        for wp in drone.get("waypoints", [])
+    )
+    header = ["drone_id", "time", "x", "y", "z", "yaw"]
+    if has_color:
+        header += ["r", "g", "b"]
+    writer.writerow(header)
+
     for drone in choreo_data.get("drones", []):
         d_id = drone["id"]
         for wp in drone.get("waypoints", []):
-            writer.writerow([
-                d_id,
-                wp["time"],
-                wp["x"],
-                wp["y"],
-                wp["z"],
-                wp["yaw"]
-            ])
-            
+            row = [d_id, wp["time"], wp["x"], wp["y"], wp["z"], wp["yaw"]]
+            if has_color:
+                row += [wp.get("r", 255), wp.get("g", 255), wp.get("b", 255)]
+            writer.writerow(row)
+
     return output.getvalue()
 
 def export_kml(choreo_data: dict, home_lat: float = 12.9716, home_lon: float = 77.5946) -> str:
