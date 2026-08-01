@@ -11,6 +11,7 @@ from typing import Optional
 from studio.generator import generate_circle, generate_helix, generate_heart, generate_cube, generate_spline
 from studio.validator import validate_choreography
 from studio.exporter import export_json, export_csv, export_kml
+from studio.assignment import optimal_assignment
 
 app = FastAPI(title="Taramandal Studio Choreography Engine", version="1.0.0")
 
@@ -68,6 +69,26 @@ def api_generate(req: GenerateRequest):
 @app.post("/api/validate")
 def api_validate(choreo: dict):
     return validate_choreography(choreo)
+
+class AssignRequest(BaseModel):
+    from_pts: list = Field(..., alias="from", description="Current formation points [{x,y,z}]")
+    to_pts: list = Field(..., alias="to", description="Target formation points [{x,y,z}]")
+
+    class Config:
+        populate_by_name = True
+
+@app.post("/api/assign")
+def api_assign(req: AssignRequest):
+    """
+    Returns the minimum-travel drone→target assignment between two equal-size
+    formations, used to make formation morphs collision-free.
+    Response: {"assignment": [target_index_for_source_0, ...]}.
+    """
+    try:
+        perm = optimal_assignment(req.from_pts, req.to_pts)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"assignment": perm}
 
 @app.post("/api/export")
 def api_export(req: ExportRequest):

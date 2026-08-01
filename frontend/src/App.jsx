@@ -100,12 +100,18 @@ const buildFormation = (shape, n) => (FORMATIONS[shape] || fmtCircle)(n);
 // Stitches scenes into one full trajectory: takeoff → (hold + morph)* → land.
 // Produces the standard {drones:[{id,waypoints:[{time,x,y,z,yaw}]}]} schema so
 // preview / validation / LED / export all work unchanged.
-const buildSequencedShow = (scenes, n, rate) => {
+// `targetIdx` (optional) is a collision-free assignment: targetIdx[s][i] is the
+// index in formation s's point cloud that drone i occupies. Default is identity
+// (drone i → point i) — the naive mapping that can make morphs cross.
+const buildSequencedShow = (scenes, n, rate, targetIdx = null) => {
   if (!scenes.length || n < 1) return { drones: [], _duration: 0 };
   const TAKEOFF = 5.0, LAND = 5.0;
   const r = Math.max(1, rate), dt = 1 / r;
   const ground = Array.from({ length: n }, (_, i) => ({ x: 0, y: 2 * i, z: 0 }));
   const forms = scenes.map((s) => buildFormation(s.shape, n));
+  // Per-drone positions at each formation, honouring the assignment.
+  const idx = targetIdx || forms.map(() => Array.from({ length: n }, (_, i) => i));
+  const dronePos = forms.map((f, s) => Array.from({ length: n }, (_, i) => f[idx[s][i]]));
   const wps = Array.from({ length: n }, () => []);
   let t = 0;
   const round2 = (v) => parseFloat(v.toFixed(2));
@@ -117,24 +123,78 @@ const buildSequencedShow = (scenes, n, rate) => {
   };
   const lerp = (A, B, k) => A.map((a, i) => ({ x: a.x + (B[i].x - a.x) * k, y: a.y + (B[i].y - a.y) * k, z: a.z + (B[i].z - a.z) * k }));
 
-  // Takeoff: ground → first formation
-  const toSteps = Math.round(TAKEOFF * r);
-  for (let s = 0; s <= toSteps; s++) { push(lerp(ground, forms[0], s / toSteps)); t += dt; }
-  // Each scene: hold, then morph to the next
-  for (let s = 0; s < forms.length; s++) {
-    const holdSteps = Math.round((scenes[s].hold || 3) * r);
-    for (let k = 0; k <= holdSteps; k++) { push(forms[s]); t += dt; }
-    if (s < forms.length - 1) {
-      const trSteps = Math.round((scenes[s].transition || 3) * r);
-      for (let k = 1; k <= trSteps; k++) { push(lerp(forms[s], forms[s + 1], k / trSteps)); t += dt; }
+  // A hover point directly above each ground pad, at show altitude. Drones take
+  // off and land purely vertically over their own pad (no horizontal motion → no
+  // crossing); all horizontal repositioning is done as layered morphs at altitude.
+  const padHover = Array.from({ length: n }, (_, i) => ({ x: 0, y: 2 * i, z: -SHOW_ALT }));
+
+  // Horizontal morph with per-drone transient transit altitude: crossing straight
+  // paths pass at different heights (assignment shortens travel but can't stop two
+  // segments intersecting). Centred layering balances the excursion; the trapezoid
+  // holds full vertical separation through the crossing-prone middle. z is NED
+  // (negative = up), so subtracting the lift raises the drone. TRANSIT_GAP > 1.5 m.
+  const TRANSIT_GAP = 1.4;             // vertical layer spacing (> 0.8 m proximity limit)
+  const MAX_H = 3.2, MAX_V = 2.4;      // velocity budget (m/s); ×1.5 smoothstep peak stays < 6
+  const smooth = (u) => u * u * (3 - 2 * u);          // ease-in-out: zero velocity at ends
+  // Smoothstep-rounded trapezoid for the transit lift: full separation through the
+  // crossing-prone middle, eased corners so acceleration stays within limits.
+  const transitProfile = (kk) => {
+    const raw = Math.max(0, Math.min(1, kk / 0.4, (1 - kk) / 0.4));
+    return smooth(raw);
+  };
+  const morph = (from, to, secs) => {
+    // Auto-pace: never exceed the velocity budget, regardless of the user's
+    // requested transition time (respect the safety limit over timing). Both the
+    // horizontal move and the vertical lift ease in/out (smoothstep) so velocity
+    // is zero at the hold junctions — no acceleration spikes.
+    const maxTravel = Math.max(...from.map((a, i) => Math.hypot(a.x - to[i].x, a.y - to[i].y)));
+    const maxLift = TRANSIT_GAP * (n - 1) / 2;
+    const secsSafe = Math.max(secs, maxTravel / MAX_H, maxLift / (0.4 * MAX_V));
+    const steps = Math.max(1, Math.round(secsSafe * r));
+    for (let k = 1; k <= steps; k++) {
+      const kk = k / steps, prof = transitProfile(kk);
+      push(lerp(from, to, smooth(kk)).map((p, i) => ({ x: p.x, y: p.y, z: p.z - TRANSIT_GAP * (i - (n - 1) / 2) * prof })));
+      t += dt;
     }
+  };
+  const straight = (from, to, secs, incFirst) => {
+    const steps = Math.max(1, Math.round(secs * r));
+    for (let k = incFirst ? 0 : 1; k <= steps; k++) { push(lerp(from, to, k / steps)); t += dt; }
+  };
+
+  straight(ground, padHover, TAKEOFF, true);   // vertical take-off from pads
+  morph(padHover, dronePos[0], 3.0);            // fly out to first formation
+  for (let s = 0; s < dronePos.length; s++) {
+    const holdSteps = Math.round((scenes[s].hold || 3) * r);
+    for (let k = 0; k <= holdSteps; k++) { push(dronePos[s]); t += dt; }
+    if (s < dronePos.length - 1) morph(dronePos[s], dronePos[s + 1], scenes[s].transition || 3);
   }
-  // Landing: last formation → ground
-  const lastForm = forms[forms.length - 1];
-  const laSteps = Math.round(LAND * r);
-  for (let k = 1; k <= laSteps; k++) { push(lerp(lastForm, ground, k / laSteps)); t += dt; }
+  morph(dronePos[dronePos.length - 1], padHover, 3.0); // return over pads
+  straight(padHover, ground, LAND, false);             // vertical landing
 
   return { drones: wps.map((w, i) => ({ id: i, waypoints: w })), _duration: round2(t - dt) };
+};
+
+// Computes the collision-free assignment chain across a scene list by asking the
+// backend for the min-travel matching between each consecutive formation pair.
+// Returns targetIdx[s][i] (point index drone i occupies at formation s), or null
+// if the backend is unreachable (caller falls back to identity mapping).
+const computeAssignmentChain = async (scenes, n, apiBase) => {
+  const forms = scenes.map((s) => buildFormation(s.shape, n));
+  const targetIdx = [Array.from({ length: n }, (_, i) => i)]; // formation 0: identity
+  for (let s = 0; s < forms.length - 1; s++) {
+    const cur = targetIdx[s];
+    const fromPts = Array.from({ length: n }, (_, i) => forms[s][cur[i]]);
+    const resp = await fetch(`${apiBase}/api/assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from: fromPts, to: forms[s + 1] }),
+    });
+    if (!resp.ok) throw new Error(`assign failed (${resp.status})`);
+    const data = await resp.json();
+    targetIdx.push(data.assignment);
+  }
+  return targetIdx;
 };
 
 export default function App() {
@@ -1030,12 +1090,21 @@ export default function App() {
     setScenes(copy);
   };
 
-  const handleBuildSequence = () => {
+  const handleBuildSequence = async () => {
     if (!scenes.length) { setError("Add at least one formation scene."); return; }
     setLoading(true);
     setError(null);
     try {
-      const show = buildSequencedShow(scenes, numDrones, Number(rate));
+      // Ask the backend for a collision-free drone→target assignment between each
+      // consecutive formation, so morphs don't cross. Fall back to identity if
+      // the backend is unreachable (still builds, just naive mapping).
+      let targetIdx = null;
+      try {
+        targetIdx = await computeAssignmentChain(scenes, numDrones, API_BASE);
+      } catch (e) {
+        console.warn("Collision-free assignment unavailable, using naive mapping:", e.message);
+      }
+      const show = buildSequencedShow(scenes, numDrones, Number(rate), targetIdx);
       setChoreoData(show);
       setDuration(show._duration);
       setCurrentTime(0.0);
